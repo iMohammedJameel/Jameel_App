@@ -1,0 +1,381 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // This security rules file assumes the following data structures:
+    //
+    // Collection: employees
+    // Document ID: {uid} (Firebase Auth UID)
+    // Access: Owner read, profile create (restricted fields), and profile update
+    //   ('name', 'department', 'fcmToken', and 'fcmUpdatedAt' only); delete denied.
+    //   Admin/backend-managed fields (e.g. joinDate, role, annualLeaveBalance,
+    //   assignedSite, salary, isAdmin) and email cannot be set on create or modified on update.
+    // Fields:
+    //   - name: string (required on create, trimmed length >= 1 and raw length <= 120)
+    //   - email: string (optional on create, length <= 200, must match auth token email when present; immutable on update - PII)
+    //   - department: string (optional, length <= 100)
+    //   - fcmToken: string (optional, update-only, 1 <= length <= 500)
+    //   - fcmUpdatedAt: timestamp (optional, update-only, must equal request.time when updated)
+    //   - role: string (backend/admin managed; e.g. 'employee', 'manager', 'hr'; immutable by client)
+    //   - annualLeaveBalance: int (backend/admin managed; immutable by client)
+    //   - assignedSite: map (backend/admin managed; immutable by client)
+    //   - joinDate: timestamp (backend/admin managed; immutable by client)
+    //
+    // Subcollection: employees/{uid}/locations
+    // Document ID: {locationId} (auto-generated)
+    // Access: Owner read & create; update and delete denied.
+    // Fields:
+    //   - latitude: number (required, -90 <= latitude <= 90)
+    //   - longitude: number (required, -180 <= longitude <= 180)
+    //   - timestamp: timestamp (required, must equal request.time on create)
+    //   - type: string (optional, one of ['check_in', 'check_out'])
+    //   - address: string (optional, length <= 300)
+    //   - siteName: string (optional, length <= 120)
+    //   - capturedAt: string (optional, ISO 8601 timestamp string, length <= 40)
+    //
+    // Collection: requests
+    // Document ID: {requestId} (auto-generated)
+    // Access: Owner or manager/HR read; owner create (pending); owner cancel
+    //   (pending -> cancelled) or manager/HR review (pending -> approved/rejected);
+    //   delete denied.
+    // Fields:
+    //   - type: string (required, one of ['leave', 'loan', 'complaint', 'suggestion'])
+    //   - description: string (required, 10 <= length <= 2000)
+    //   - status: string (required, must equal 'pending' on create; 'cancelled' on owner cancel; 'approved'/'rejected' on manager/HR review)
+    //   - timestamp: timestamp (required, must equal request.time on create; immutable)
+    //   - employeeId: string (required, must equal request.auth.uid on create; immutable)
+    //   - employeeName: string or null (optional, length <= 120 when string; immutable)
+    //   - leaveCategory: string (optional, leave-only when type == 'leave', one of ['annual', 'sick', 'emergency', 'unpaid']; immutable)
+    //   - startDate: string (optional, leave-only when type == 'leave', ISO 8601 timestamp string, length <= 40; immutable)
+    //   - endDate: string (optional, leave-only when type == 'leave', ISO 8601 timestamp string, length <= 40, endDate >= startDate when both present; immutable)
+    //   - amount: number (optional, loan-only when type == 'loan', 0 < amount <= 1000000000; immutable)
+    //   - reviewedBy: string (review-only, must equal request.auth.uid)
+    //   - reviewedAt: timestamp (review-only, must equal request.time)
+    //   - reviewNote: string (optional, review-only, length <= 500)
+    //
+    // Collection: notifications
+    // Document ID: {notificationId}
+    // Access: Owner read & mark-as-read update; create and delete denied.
+    // Fields:
+    //   - employeeId: string (immutable owner UID)
+    //   - title: string (notification title)
+    //   - message: string (notification body)
+    //   - type: string (notification category)
+    //   - date: timestamp (notification timestamp)
+    //   - isRead: bool (client may only update from any state to true)
+    //
+    // Collection: inspections
+    // Document ID: {inspectionId} (auto-generated)
+    // Access: Owner or manager/HR read & authenticated create (attributed via employeeId);
+    //   update and delete denied.
+    // Fields:
+    //   - employeeId: string (required, must equal request.auth.uid)
+    //   - latitude: number (required, -90 <= latitude <= 90)
+    //   - longitude: number (required, -180 <= longitude <= 180)
+    //   - capturedAt: string (required, ISO 8601 timestamp string, length <= 40)
+    //   - uploadedAt: timestamp (required, must equal request.time on create)
+    //   - size: int (required, 0 < size <= 52428800 bytes)
+    //   - storagePath: string (optional, length <= 300, scoped to inspections/{uid}/)
+    //   - downloadUrl: string (optional, http(s) URL, length <= 1000)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if authenticated user owns the path/document UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if authenticated user owns an existing document via employeeId
+    function isEmployeeDocOwner() {
+      return isAuthenticated() && resource.data.employeeId == request.auth.uid;
+    }
+
+    // Check if authenticated user has a manager or HR role on their employee profile
+    function isManagerOrHr() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/employees/$(request.auth.uid)) &&
+        'role' in get(/databases/$(database)/documents/employees/$(request.auth.uid)).data &&
+        get(/databases/$(database)/documents/employees/$(request.auth.uid)).data.role in ['manager', 'hr'];
+    }
+
+    // Verify required fields exist in the incoming document
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Verify incoming document contains only allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate URL format (must start with https:// or http://)
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // Validate ISO 8601 date-time format produced by Dart DateTime.toIso8601String()
+    // Format check only; bounded in size by callers to prevent 1MB string DoS.
+    function isValidDateString(dateStr) {
+      return dateStr is string &&
+        dateStr.size() <= 40 &&
+        dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z?$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidEmployeeCreate(data) {
+      return hasRequiredFields(['name']) &&
+        hasOnlyAllowedFields(['name', 'email', 'department']) &&
+        data.name is string &&
+        data.name.trim().size() >= 1 &&
+        data.name.size() <= 120 &&
+        (!('department' in data) ||
+          (data.department is string && data.department.size() <= 100)) &&
+        (!('email' in data) ||
+          (data.email is string &&
+           data.email.size() <= 200 &&
+           (!('email' in request.auth.token) ||
+            request.auth.token.email == null ||
+            data.email == request.auth.token.email)));
+    }
+
+    function isValidEmployeeUpdate(data) {
+      let affected = request.resource.data.diff(resource.data).affectedKeys();
+      return affected.hasOnly(['name', 'department', 'fcmToken', 'fcmUpdatedAt']) &&
+        (!('name' in affected) || 'name' in data) &&
+        (!('name' in data) ||
+          (data.name is string &&
+           data.name.trim().size() >= 1 &&
+           data.name.size() <= 120)) &&
+        (!('department' in data) ||
+          (data.department is string && data.department.size() <= 100)) &&
+        (!('fcmToken' in affected) ||
+          ('fcmToken' in data &&
+           data.fcmToken is string &&
+           data.fcmToken.size() >= 1 &&
+           data.fcmToken.size() <= 500)) &&
+        (!('fcmToken' in data) ||
+          (data.fcmToken is string &&
+           data.fcmToken.size() >= 1 &&
+           data.fcmToken.size() <= 500)) &&
+        (!('fcmUpdatedAt' in affected) ||
+          ('fcmUpdatedAt' in data &&
+           data.fcmUpdatedAt is timestamp &&
+           data.fcmUpdatedAt == request.time)) &&
+        (!('fcmUpdatedAt' in data) || data.fcmUpdatedAt is timestamp);
+    }
+
+    function isValidLocation(data) {
+      return hasRequiredFields(['latitude', 'longitude', 'timestamp']) &&
+        hasOnlyAllowedFields([
+          'latitude',
+          'longitude',
+          'timestamp',
+          'type',
+          'address',
+          'siteName',
+          'capturedAt'
+        ]) &&
+        data.latitude is number &&
+        data.latitude >= -90 &&
+        data.latitude <= 90 &&
+        data.longitude is number &&
+        data.longitude >= -180 &&
+        data.longitude <= 180 &&
+        data.timestamp is timestamp &&
+        data.timestamp == request.time &&
+        (!('type' in data) ||
+          (data.type is string && data.type in ['check_in', 'check_out'])) &&
+        (!('address' in data) ||
+          (data.address is string && data.address.size() <= 300)) &&
+        (!('siteName' in data) ||
+          (data.siteName is string && data.siteName.size() <= 120)) &&
+        (!('capturedAt' in data) || isValidDateString(data.capturedAt));
+    }
+
+    function isValidRequest(data) {
+      return hasRequiredFields(['type', 'description', 'status', 'timestamp', 'employeeId']) &&
+        hasOnlyAllowedFields([
+          'type',
+          'description',
+          'status',
+          'timestamp',
+          'employeeId',
+          'employeeName',
+          'leaveCategory',
+          'startDate',
+          'endDate',
+          'amount'
+        ]) &&
+        data.type is string &&
+        data.type in ['leave', 'loan', 'complaint', 'suggestion'] &&
+        data.description is string &&
+        data.description.size() >= 10 &&
+        data.description.size() <= 2000 &&
+        data.status is string &&
+        data.status in ['pending', 'approved', 'rejected'] &&
+        data.timestamp is timestamp &&
+        data.timestamp == request.time &&
+        data.employeeId is string &&
+        data.employeeId == request.auth.uid &&
+        (!('employeeName' in data) ||
+          data.employeeName == null ||
+          (data.employeeName is string && data.employeeName.size() <= 120)) &&
+        (!('leaveCategory' in data) ||
+          (data.type == 'leave' &&
+           data.leaveCategory is string &&
+           data.leaveCategory in ['annual', 'sick', 'emergency', 'unpaid'])) &&
+        (!('startDate' in data) ||
+          (data.type == 'leave' && isValidDateString(data.startDate))) &&
+        (!('endDate' in data) ||
+          (data.type == 'leave' && isValidDateString(data.endDate))) &&
+        (!('startDate' in data && 'endDate' in data) ||
+          data.endDate >= data.startDate) &&
+        (!('amount' in data) ||
+          (data.type == 'loan' &&
+           data.amount is number &&
+           data.amount > 0 &&
+           data.amount <= 1000000000));
+    }
+
+    function isValidRequestCancel(data) {
+      return resource.data.status == 'pending' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+        data.status == 'cancelled';
+    }
+
+    function isValidRequestReview(data) {
+      return resource.data.status == 'pending' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'reviewedBy',
+          'reviewedAt',
+          'reviewNote'
+        ]) &&
+        data.status in ['approved', 'rejected'] &&
+        data.reviewedBy == request.auth.uid &&
+        data.reviewedAt == request.time &&
+        (!('reviewNote' in data) ||
+          (data.reviewNote is string && data.reviewNote.size() <= 500));
+    }
+
+    function isValidNotificationUpdate(data) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']) &&
+        data.isRead is bool &&
+        data.isRead == true &&
+        data.employeeId is string &&
+        data.employeeId == request.auth.uid &&
+        data.employeeId == resource.data.employeeId &&
+        (!('title' in data) || (data.title is string && data.title.size() <= 500)) &&
+        (!('message' in data) || (data.message is string && data.message.size() <= 2000)) &&
+        (!('type' in data) || (data.type is string && data.type.size() <= 50)) &&
+        (!('date' in data) || data.date is timestamp);
+    }
+
+    function isValidInspection(data) {
+      return hasRequiredFields(['employeeId', 'latitude', 'longitude', 'capturedAt', 'uploadedAt', 'size']) &&
+        hasOnlyAllowedFields([
+          'employeeId',
+          'latitude',
+          'longitude',
+          'capturedAt',
+          'uploadedAt',
+          'size',
+          'storagePath',
+          'downloadUrl'
+        ]) &&
+        data.employeeId is string &&
+        data.employeeId == request.auth.uid &&
+        data.latitude is number &&
+        data.latitude >= -90 &&
+        data.latitude <= 90 &&
+        data.longitude is number &&
+        data.longitude >= -180 &&
+        data.longitude <= 180 &&
+        isValidDateString(data.capturedAt) &&
+        data.uploadedAt is timestamp &&
+        data.uploadedAt == request.time &&
+        data.size is int &&
+        data.size > 0 &&
+        data.size <= 52428800 &&
+        (!('storagePath' in data) ||
+          (data.storagePath is string &&
+           data.storagePath.size() <= 300 &&
+           data.storagePath.matches('^inspections/' + request.auth.uid + '/[^/]+$'))) &&
+        (!('downloadUrl' in data) ||
+          (isValidUrl(data.downloadUrl) &&
+           data.downloadUrl.size() <= 1000));
+    }
+
+    // ===============================================================
+    // Default Deny
+    // ===============================================================
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // Employee profile documents (contain PII; owner may read, create limited
+    // profile fields, and update only name, department, fcmToken, and fcmUpdatedAt)
+    match /employees/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && isValidEmployeeCreate(request.resource.data);
+      allow update: if isOwner(uid) && isValidEmployeeUpdate(request.resource.data);
+      allow delete: if false;
+
+      // Employee GPS check-in/out locations (append-only from owning client)
+      match /locations/{locationId} {
+        allow read: if isOwner(uid);
+        allow create: if isOwner(uid) && isValidLocation(request.resource.data);
+        allow update, delete: if false;
+      }
+    }
+
+    // Employee requests (leave, loan, complaint, suggestion)
+    match /requests/{requestId} {
+      allow read: if isEmployeeDocOwner() || isManagerOrHr();
+      allow create: if isAuthenticated() &&
+        isValidRequest(request.resource.data) &&
+        request.resource.data.status == 'pending';
+      allow update: if (isEmployeeDocOwner() && isValidRequestCancel(request.resource.data)) ||
+        (isManagerOrHr() && isValidRequestReview(request.resource.data));
+      allow delete: if false;
+    }
+
+    // Employee notifications (backend created; client may only mark as read)
+    match /notifications/{notificationId} {
+      allow read: if isEmployeeDocOwner();
+      allow update: if isEmployeeDocOwner() &&
+        isValidNotificationUpdate(request.resource.data);
+      allow create, delete: if false;
+    }
+
+    // Inspection capture records with GPS and employee attribution
+    match /inspections/{inspectionId} {
+      allow read: if isEmployeeDocOwner() || isManagerOrHr();
+      allow create: if isAuthenticated() && isValidInspection(request.resource.data);
+      allow update, delete: if false;
+    }
+  }
+}
